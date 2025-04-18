@@ -198,6 +198,31 @@ void relu_d(double* hidden){
 }
 
 // Forward pass
+void forward_stream(NeuralNetworkDevice* net, double* hidden, double* output, double* input_d, cudaStream_t stream) {
+    cudaMemcpyToSymbolAsync(input, input_d, INPUT_SIZE * sizeof(double), 0, cudaMemcpyDeviceToDevice, stream);
+
+
+    init_hidden<<<1, HIDDEN_SIZE, 0, stream>>>(net, hidden);
+    cudaDeviceSynchronize();
+
+    dim3 block((HIDDEN_SIZE + BLOCK_SIZE - 1)/BLOCK_SIZE, (INPUT_SIZE + BLOCK_SIZE - 1)/BLOCK_SIZE+1);
+    dim3 threads(BLOCK_SIZE, BLOCK_SIZE);
+    layer1<<<block, threads, 0, stream>>>(net, hidden);
+
+    relu_d<<<1, HIDDEN_SIZE, 0, stream>>>(hidden);
+
+    dim3 block2((OUTPUT_SIZE + BLOCK_SIZE - 1)/BLOCK_SIZE, (HIDDEN_SIZE + BLOCK_SIZE - 1)/BLOCK_SIZE);
+    dim3 threads2(BLOCK_SIZE, BLOCK_SIZE);
+    layer2<<<block2, threads2, 0, stream>>>(net, hidden, output);
+    // layer2<<<1, OUTPUT_SIZE>>>(net, hidden, output);
+    
+    double* tempOutput = (double*)malloc(OUTPUT_SIZE*sizeof(double));
+    cudaMemcpyAsync(tempOutput, output, OUTPUT_SIZE*sizeof(double), cudaMemcpyDeviceToHost, stream);
+
+    softmax(tempOutput, OUTPUT_SIZE);
+
+    cudaMemcpyAsync(output, tempOutput, OUTPUT_SIZE*sizeof(double), cudaMemcpyHostToDevice, stream );
+}
 void forward(NeuralNetworkDevice* net, double* hidden, double* output) {
 
     init_hidden<<<1, HIDDEN_SIZE>>>(net, hidden);
@@ -205,7 +230,7 @@ void forward(NeuralNetworkDevice* net, double* hidden, double* output) {
 
     dim3 block((HIDDEN_SIZE + BLOCK_SIZE - 1)/BLOCK_SIZE, (INPUT_SIZE + BLOCK_SIZE - 1)/BLOCK_SIZE+1);
     dim3 threads(BLOCK_SIZE, BLOCK_SIZE);
-    layer1<<<block, threads >>>(net, hidden);
+    layer1<<<block, threads>>>(net, hidden);
 
     relu_d<<<1, HIDDEN_SIZE>>>(hidden);
 
@@ -232,19 +257,6 @@ void layerGradient(double* d_output, double* output, double* target){
     }
 }
 
-// __global__
-// void hiddenLayerGradient(NeuralNetworkDevice* net, double* d_hidden, double* hidden, double* d_output){
-//     int hiddenIdx = blockIdx.x;
-//     int outputIdx = threadIdx.x;
-
-//     atomicAddDouble(&d_hidden[hiddenIdx], net->W2[outputIdx*HIDDEN_SIZE + hiddenIdx] * d_output[outputIdx]);
-
-//     __syncthreads();
-    
-//     if(outputIdx == 0){
-//         d_hidden[hiddenIdx] *= (hidden[hiddenIdx] > 0);
-//     }
-// }
 __global__
 void hiddenLayerGradient(NeuralNetworkDevice* net, double* d_hidden, double* hidden, double* d_output) {
     int hiddenIdx = threadIdx.x + blockIdx.x * blockDim.x;
@@ -300,23 +312,40 @@ void updateWeights1(NeuralNetworkDevice* net, double* d_hidden){
 }
 
 // Backpropagation
-void backward(NeuralNetworkDevice* net,  double* hidden, double* output, double* target) {
+void backward(NeuralNetworkDevice* net, double* hidden, double* output, double* target, cudaStream_t stream) {
     double* d_output;
     double* d_hidden;
 
-    cudaMalloc((void**)&d_output, OUTPUT_SIZE* sizeof(double));
-    cudaMalloc((void**)&d_hidden, HIDDEN_SIZE* sizeof(double));
+    cudaMalloc(&d_output, OUTPUT_SIZE * sizeof(double));
+    cudaMalloc(&d_hidden, HIDDEN_SIZE * sizeof(double));
     cudaMemset(d_output, 0, OUTPUT_SIZE * sizeof(double));
     cudaMemset(d_hidden, 0, HIDDEN_SIZE * sizeof(double));
 
     layerGradient<<<1, OUTPUT_SIZE>>>(d_output, output, target);
-
-    // hiddenLayerGradient<<<HIDDEN_SIZE, OUTPUT_SIZE>>>(net, d_hidden, hidden, d_output);
     hiddenLayerGradient<<<1, HIDDEN_SIZE>>>(net, d_hidden, hidden, d_output);
 
     updateWeights2<<<OUTPUT_SIZE, HIDDEN_SIZE>>>(net, hidden, d_output);
-
     updateWeights1<<<HIDDEN_SIZE, INPUT_SIZE>>>(net, d_hidden);
+    
+}
+
+void backward_stream(NeuralNetworkDevice* net, double* hidden, double* output, double* target, cudaStream_t stream) {
+    double* d_output;
+    double* d_hidden;
+
+    cudaMallocAsync(&d_output, OUTPUT_SIZE * sizeof(double), stream);
+    cudaMallocAsync(&d_hidden, HIDDEN_SIZE * sizeof(double), stream);
+    cudaMemset(d_output, 0, OUTPUT_SIZE * sizeof(double));
+    cudaMemset(d_hidden, 0, HIDDEN_SIZE * sizeof(double));
+
+    layerGradient<<<1, OUTPUT_SIZE, 0, stream>>>(d_output, output, target);
+    hiddenLayerGradient<<<1, HIDDEN_SIZE, 0, stream>>>(net, d_hidden, hidden, d_output);
+
+    updateWeights2<<<OUTPUT_SIZE, HIDDEN_SIZE, 0, stream>>>(net, hidden, d_output);
+    updateWeights1<<<HIDDEN_SIZE, INPUT_SIZE, 0, stream>>>(net, d_hidden);
+    
+    cudaFreeAsync(d_output, stream);
+    cudaFreeAsync(d_hidden, stream);
 }
 
 void assignMemory( double** hidden, double** output, double** label) {
@@ -327,8 +356,26 @@ void assignMemory( double** hidden, double** output, double** label) {
 
 // Train network
 void train(NeuralNetworkDevice* net_d, double** images, double** labels, int numImages) {
-    double *hidden_d, *output_d, *label_d;
-    assignMemory(&hidden_d, &output_d, &label_d);
+
+    const int NUM_STREAMS = 4;
+    cudaStream_t streams[NUM_STREAMS];
+    for (int i = 0; i < NUM_STREAMS; ++i) {
+        cudaStreamCreate(&streams[i]);
+    }
+
+    // double *hidden_d, *output_d, *label_d;
+    // assignMemory(&hidden_d, &output_d, &label_d);
+    double *input_d[NUM_STREAMS], *label_d[NUM_STREAMS], *output_d[NUM_STREAMS], *hidden_d[NUM_STREAMS];
+    double* h_output[NUM_STREAMS];
+
+    for (int i = 0; i < NUM_STREAMS; ++i) {
+        cudaMalloc(&input_d[i], INPUT_SIZE * sizeof(double));
+        cudaMalloc(&label_d[i], OUTPUT_SIZE * sizeof(double));
+        cudaMalloc(&output_d[i], OUTPUT_SIZE * sizeof(double));
+        cudaMalloc(&hidden_d[i], HIDDEN_SIZE * sizeof(double));
+        cudaHostAlloc(&h_output[i], OUTPUT_SIZE * sizeof(double), cudaHostAllocDefault);
+    }
+
 
     clock_t total_start = clock();
     for (int epoch = 0; epoch < EPOCHS; epoch++) {
@@ -336,29 +383,51 @@ void train(NeuralNetworkDevice* net_d, double** images, double** labels, int num
         double loss = 0.0;
         int correct = 0;
 
-        for (int i = 0; i < numImages; i++) {
-            double* output = (double*)malloc(OUTPUT_SIZE * sizeof(double));
-            cudaMemcpyToSymbol(input, images[i], INPUT_SIZE * sizeof(double));
-            cudaMemcpy(label_d, labels[i], OUTPUT_SIZE * sizeof(double), cudaMemcpyHostToDevice);
-            
-            forward(net_d,  hidden_d, output_d);
-            backward(net_d, hidden_d, output_d, label_d);
-            
-            cudaMemcpy(output, output_d, OUTPUT_SIZE* sizeof(double), cudaMemcpyDeviceToHost);
-
-            // Compute loss & accuracy
-            for (int k = 0; k < OUTPUT_SIZE; k++) loss -= labels[i][k] * log(output[k] + 1e-12);
-            int pred = 0, actual = 0;
-            for (int j = 0; j < OUTPUT_SIZE; j++) {
-                if (output[j] > output[pred]) pred = j;
-                if (labels[i][j] > labels[i][actual]) actual = j;
+        for (int i = 0; i < numImages; i += NUM_STREAMS) {
+            for (int s = 0; s < NUM_STREAMS && (i + s) < numImages; s++) {
+                int imgIdx = i + s;
+        
+                cudaMemcpyAsync(input_d[s], images[imgIdx], INPUT_SIZE * sizeof(double), cudaMemcpyHostToDevice, streams[s]);
+                cudaMemcpyAsync(label_d[s], labels[imgIdx], OUTPUT_SIZE * sizeof(double), cudaMemcpyHostToDevice, streams[s]);
+        
+                // Forward/Backward kernels — need to support stream as param
+                forward_stream(net_d, hidden_d[s], output_d[s], input_d[s], streams[s]);
+                backward_stream(net_d, hidden_d[s], output_d[s], label_d[s], streams[s]);
+        
+                // Copy output back
+                cudaMemcpyAsync(h_output[s], output_d[s], OUTPUT_SIZE * sizeof(double), cudaMemcpyDeviceToHost, streams[s]);
             }
-            if (pred == actual) correct++;
+        
+            // Sync all streams before processing outputs
+            for (int s = 0; s < NUM_STREAMS && (i + s) < numImages; s++) {
+                cudaStreamSynchronize(streams[s]);
+        
+                // Evaluate result
+                int pred = 0, actual = 0;
+                for (int j = 0; j < OUTPUT_SIZE; j++) {
+                    if (h_output[s][j] > h_output[s][pred]) pred = j;
+                    if (labels[i + s][j] > labels[i + s][actual]) actual = j;
+                    loss -= labels[i + s][j] * log(h_output[s][j] + 1e-12);
+                }
+                if (pred == actual) correct++;
+            }
         }
+        
         printf("Epoch %d - Loss: %.4f - Train Accuracy: %.2f%% - Time: %.3fs\n",
                epoch + 1, loss / numImages, (correct / (double)numImages) * 100, get_time(epoch_start));
     }
     printf("Total training time: %.3fs\n", get_time(total_start));
+
+
+    for (int i = 0; i < NUM_STREAMS; ++i) {
+        cudaFree(input_d[i]);
+        cudaFree(label_d[i]);
+        cudaFree(output_d[i]);
+        cudaFree(hidden_d[i]);
+        cudaFreeHost(h_output[i]);
+        cudaStreamDestroy(streams[i]);
+    }
+    
 }
 
 // Evaluate accuracy on test data
@@ -371,10 +440,7 @@ void evaluate(NeuralNetworkDevice* net_d, double** images, double** labels, int 
     for (int i = 0; i < numImages; i++) {
         double* output = (double*)malloc(OUTPUT_SIZE * sizeof(double));
         cudaMemcpyToSymbol(input, images[i], INPUT_SIZE * sizeof(double));
-            
-            
-
-
+  
         forward(net_d,  hidden_d, output_d);
         
         cudaMemcpy(output, output_d, OUTPUT_SIZE* sizeof(double), cudaMemcpyDeviceToHost);

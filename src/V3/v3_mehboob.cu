@@ -11,11 +11,13 @@
 #define OUTPUT_SIZE 10
 #define LEARNING_RATE 0.01
 #define EPOCHS 3
-#define BATCH_SIZE 16
+#define BATCH_SIZE 64
 #define NUM_CLASSES 10  // Digits 0-9
 #define BLOCK_SIZE 32
 
 __constant__  double input[INPUT_SIZE];
+
+
 
 // Timer function
 double get_time(clock_t start) {
@@ -160,31 +162,14 @@ void layer1(NeuralNetworkDevice* net, double* hidden){
     }
 }
 __global__
-void layer2(NeuralNetworkDevice* net, double* hidden, double* output) {
-    int outputIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    int hiddenIdx = blockIdx.y * blockDim.y + threadIdx.y;
-    int outputLocal = threadIdx.x;
-    int hiddenLocal = threadIdx.y;
+void layer2(NeuralNetworkDevice* net, double* hidden, double* output){
+    int outputIdx = threadIdx.x;
 
-    if (outputIdx < OUTPUT_SIZE && hiddenIdx < HIDDEN_SIZE) {
-        __shared__ double sHidden[BLOCK_SIZE];
-        __shared__ double sOutput[BLOCK_SIZE];
+    double tempOutput= net->b2[outputIdx];
+    for (int j = 0; j < HIDDEN_SIZE; j++)
+        tempOutput += net->W2[outputIdx* HIDDEN_SIZE + j] * hidden[j];
 
-        if (hiddenLocal == 0)
-            sOutput[outputLocal] = 0;
-
-        if (outputLocal == 0)
-            sHidden[hiddenLocal] = hidden[hiddenIdx];
-
-        __syncthreads();
-
-        atomicAddDouble(&sOutput[outputLocal], net->W2[outputIdx * HIDDEN_SIZE + hiddenIdx] * sHidden[hiddenLocal]);
-
-        __syncthreads();
-
-        if (hiddenLocal == 0)
-            atomicAddDouble(&output[outputIdx], sOutput[outputLocal]);
-    }
+    output[outputIdx] = tempOutput;
 }
 
 __global__
@@ -196,23 +181,21 @@ void relu_d(double* hidden){
 
     hidden[threadIdx.x] = tempHidden;
 }
-
 // Forward pass
 void forward(NeuralNetworkDevice* net, double* hidden, double* output) {
 
     init_hidden<<<1, HIDDEN_SIZE>>>(net, hidden);
     cudaDeviceSynchronize();
 
-    dim3 block((HIDDEN_SIZE + BLOCK_SIZE - 1)/BLOCK_SIZE, (INPUT_SIZE + BLOCK_SIZE - 1)/BLOCK_SIZE+1);
+    dim3 block(HIDDEN_SIZE/BLOCK_SIZE+1, INPUT_SIZE/BLOCK_SIZE+1);
     dim3 threads(BLOCK_SIZE, BLOCK_SIZE);
     layer1<<<block, threads >>>(net, hidden);
 
+
     relu_d<<<1, HIDDEN_SIZE>>>(hidden);
 
-    dim3 block2((OUTPUT_SIZE + BLOCK_SIZE - 1)/BLOCK_SIZE, (HIDDEN_SIZE + BLOCK_SIZE - 1)/BLOCK_SIZE);
-    dim3 threads2(BLOCK_SIZE, BLOCK_SIZE);
-    layer2<<<block2, threads2>>>(net, hidden, output);
-    // layer2<<<1, OUTPUT_SIZE>>>(net, hidden, output);
+
+    layer2<<<1, OUTPUT_SIZE>>>(net, hidden, output);
     
     double* tempOutput = (double*)malloc(OUTPUT_SIZE*sizeof(double));
     cudaMemcpy(tempOutput, output, OUTPUT_SIZE*sizeof(double), cudaMemcpyDeviceToHost);
@@ -227,49 +210,23 @@ void layerGradient(double* d_output, double* output, double* target){
     int id = threadIdx.x;
 
     if(id < OUTPUT_SIZE){
-    for(int id = 0; id < OUTPUT_SIZE; id++)
         d_output[id] = output[id]-target[id];
     }
 }
 
-// __global__
-// void hiddenLayerGradient(NeuralNetworkDevice* net, double* d_hidden, double* hidden, double* d_output){
-//     int hiddenIdx = blockIdx.x;
-//     int outputIdx = threadIdx.x;
-
-//     atomicAddDouble(&d_hidden[hiddenIdx], net->W2[outputIdx*HIDDEN_SIZE + hiddenIdx] * d_output[outputIdx]);
-
-//     __syncthreads();
-    
-//     if(outputIdx == 0){
-//         d_hidden[hiddenIdx] *= (hidden[hiddenIdx] > 0);
-//     }
-// }
 __global__
-void hiddenLayerGradient(NeuralNetworkDevice* net, double* d_hidden, double* hidden, double* d_output) {
-    int hiddenIdx = threadIdx.x + blockIdx.x * blockDim.x;
+void hiddenLayerGradient(NeuralNetworkDevice* net, double* d_hidden, double* hidden, double* d_output){
+    int hiddenIdx = blockIdx.x;
+    int outputIdx = threadIdx.x;
 
-    if (hiddenIdx >= HIDDEN_SIZE) return;
-
-    __shared__ double shared_output[OUTPUT_SIZE];
-
-    int tid = threadIdx.x;
-    for (int i = tid; i < OUTPUT_SIZE; i += blockDim.x) {
-        shared_output[i] = d_output[i];
-    }
+    atomicAddDouble(&d_hidden[hiddenIdx], net->W2[outputIdx*HIDDEN_SIZE + hiddenIdx] * d_output[outputIdx]);
 
     __syncthreads();
-
-    double grad = 0.0;
-    for (int outputIdx = 0; outputIdx < OUTPUT_SIZE; outputIdx++) {
-        double w = net->W2[outputIdx * HIDDEN_SIZE + hiddenIdx]; 
-        grad += w * shared_output[outputIdx];
+    
+    if(outputIdx == 0){
+        d_hidden[hiddenIdx] *= (hidden[hiddenIdx] > 0);
     }
-
-    d_hidden[hiddenIdx] = grad * (hidden[hiddenIdx] > 0);
 }
-
-
 __global__ 
 void updateWeights2(NeuralNetworkDevice* net, double* hidden, double*d_output){
     int outputIdx = blockIdx.x;
@@ -301,9 +258,8 @@ void updateWeights1(NeuralNetworkDevice* net, double* d_hidden){
 
 // Backpropagation
 void backward(NeuralNetworkDevice* net,  double* hidden, double* output, double* target) {
-    double* d_output;
-    double* d_hidden;
-
+    // double d_output[OUTPUT_SIZE], d_hidden[HIDDEN_SIZE];
+    double* d_output, * d_hidden;
     cudaMalloc((void**)&d_output, OUTPUT_SIZE* sizeof(double));
     cudaMalloc((void**)&d_hidden, HIDDEN_SIZE* sizeof(double));
     cudaMemset(d_output, 0, OUTPUT_SIZE * sizeof(double));
@@ -311,8 +267,9 @@ void backward(NeuralNetworkDevice* net,  double* hidden, double* output, double*
 
     layerGradient<<<1, OUTPUT_SIZE>>>(d_output, output, target);
 
-    // hiddenLayerGradient<<<HIDDEN_SIZE, OUTPUT_SIZE>>>(net, d_hidden, hidden, d_output);
-    hiddenLayerGradient<<<1, HIDDEN_SIZE>>>(net, d_hidden, hidden, d_output);
+
+    hiddenLayerGradient<<<HIDDEN_SIZE, OUTPUT_SIZE>>>(net, d_hidden, hidden, d_output);
+
 
     updateWeights2<<<OUTPUT_SIZE, HIDDEN_SIZE>>>(net, hidden, d_output);
 
@@ -355,10 +312,13 @@ void train(NeuralNetworkDevice* net_d, double** images, double** labels, int num
             }
             if (pred == actual) correct++;
         }
+
         printf("Epoch %d - Loss: %.4f - Train Accuracy: %.2f%% - Time: %.3fs\n",
                epoch + 1, loss / numImages, (correct / (double)numImages) * 100, get_time(epoch_start));
     }
     printf("Total training time: %.3fs\n", get_time(total_start));
+
+
 }
 
 // Evaluate accuracy on test data
@@ -447,12 +407,13 @@ double** loadMNISTLabels(const char* filename, int numLabels) {
 
 // Main function
 int main() {
-    printf("MNIST Neural Network3\n\n");
+    printf("MNIST Neural Network12\n\n");
 
-    double** train_images = loadMNISTImages("../data/train-images.idx3-ubyte", 60000);
-    double** train_labels = loadMNISTLabels("../data/train-labels.idx1-ubyte", 60000);
-    double** test_images = loadMNISTImages("../data/t10k-images.idx3-ubyte", 10000);
-    double** test_labels = loadMNISTLabels("../data/t10k-labels.idx1-ubyte", 10000);
+    double** train_images = loadMNISTImages("../../data/train-images.idx3-ubyte", 60000);
+    double** train_labels = loadMNISTLabels("../../data/train-labels.idx1-ubyte", 60000);
+    double** test_images = loadMNISTImages("../../data/t10k-images.idx3-ubyte", 10000);
+    double** test_labels = loadMNISTLabels("../../data/t10k-labels.idx1-ubyte", 10000);
+
     NeuralNetworkDevice* net_d = createNetworkOnDevice();
 
     train(net_d, train_images, train_labels, 60000);
