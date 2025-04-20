@@ -1,17 +1,17 @@
 #include <stdio.h>
-#include <stdlib.h>
-#include <math.h>
-#include <time.h>
-#include <cuda_runtime.h>
-#include <curand_kernel.h>
 #include <device_launch_parameters.h>
+#include <time.h>
+#include <stdlib.h>
+#include <cuda_runtime.h>
+#include <math.h>
+#include <curand_kernel.h>
 
 #define INPUT_SIZE 784
-#define HIDDEN_SIZE 128
-#define OUTPUT_SIZE 10
-#define LEARNING_RATE 0.01
 #define EPOCHS 3
+#define LEARNING_RATE 0.01
+#define OUTPUT_SIZE 10
 #define BATCH_SIZE 64
+#define HIDDEN_SIZE 128
 #define NUM_CLASSES 10  // Digits 0-9
 
 // Timer function
@@ -62,29 +62,13 @@ typedef struct {
 } NeuralNetworkDevice;
 NeuralNetworkDevice host_net;
 
-__global__ void init_W1(double* W1, int input_size, int hidden_size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = input_size * hidden_size;
-    if (idx >= total) return;
-
-    int inputIdx = idx % input_size;
-    int hiddenIdx = idx / input_size;
-
-    // Setup random state
-    curandState state;
-    curand_init(1234, idx, 0, &state);
-
-    double rand_val = curand_uniform_double(&state);
-    W1[hiddenIdx * input_size + inputIdx] = (rand_val - 0.5) * 0.1;  // centered around 0
-}
-
 __global__ void init_W2(double* W2, int hidden_size, int output_size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = hidden_size * output_size;
     if (idx >= total) return;
 
-    int hiddenIdx = idx % hidden_size;
     int outputIdx = idx / hidden_size;
+    int hiddenIdx = idx % hidden_size;
 
     // Setup random state
     curandState state;
@@ -94,23 +78,39 @@ __global__ void init_W2(double* W2, int hidden_size, int output_size) {
     W2[outputIdx * hidden_size + hiddenIdx] = (rand_val - 0.5) * 0.1;
 
 }
+__global__ void init_W1(double* W1, int input_size, int hidden_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = input_size * hidden_size;
+    if (idx >= total) return;
+
+    int hiddenIdx = idx / input_size;
+    int inputIdx = idx % input_size;
+
+    // Setup random state
+    curandState state;
+    curand_init(1234, idx, 0, &state);
+
+    double rand_val = curand_uniform_double(&state);
+    W1[hiddenIdx * input_size + inputIdx] = (rand_val - 0.5) * 0.1;  // centered around 0
+}
+
 
 NeuralNetworkDevice* createNetworkOnDevice(){
     NeuralNetworkDevice* dev_net;
 
-    cudaMalloc((void**)&host_net.W1, sizeof(double) * HIDDEN_SIZE * INPUT_SIZE);
     cudaMalloc((void**)&host_net.W2, sizeof(double) * OUTPUT_SIZE * HIDDEN_SIZE);
-    cudaMalloc((void**)&host_net.b1, sizeof(double) * HIDDEN_SIZE);
+    cudaMalloc((void**)&host_net.W1, sizeof(double) * HIDDEN_SIZE * INPUT_SIZE);
     cudaMalloc((void**)&host_net.b2, sizeof(double) * OUTPUT_SIZE);
-    cudaMemset(host_net.b1, 0, sizeof(double) * HIDDEN_SIZE);
+    cudaMalloc((void**)&host_net.b1, sizeof(double) * HIDDEN_SIZE);
     cudaMemset(host_net.b2, 0, sizeof(double) * OUTPUT_SIZE);
+    cudaMemset(host_net.b1, 0, sizeof(double) * HIDDEN_SIZE);
     
-    int total_W1 = INPUT_SIZE * HIDDEN_SIZE;
     int total_W2 = HIDDEN_SIZE * OUTPUT_SIZE;
+    int total_W1 = INPUT_SIZE * HIDDEN_SIZE;
 
     int threads = 256;
-    int blocks_W1 = (total_W1 + threads - 1) / threads;
     int blocks_W2 = (total_W2 + threads - 1) / threads;
+    int blocks_W1 = (total_W1 + threads - 1) / threads;
 
     init_W1<<<blocks_W1, threads>>>(host_net.W1, INPUT_SIZE, HIDDEN_SIZE);
     init_W2<<<blocks_W2, threads>>>(host_net.W2, HIDDEN_SIZE, OUTPUT_SIZE);
@@ -160,9 +160,7 @@ void relu_d(double* hidden){
 void forward(NeuralNetworkDevice* net, double* input, double* hidden, double* output) {
   
     layer1<<<1, HIDDEN_SIZE>>>(net, input, hidden);
-
     relu_d<<<1, HIDDEN_SIZE>>>(hidden);
-
     layer2<<<1, OUTPUT_SIZE>>>(net, hidden, output);
     
     double* tempOutput = (double*)malloc(OUTPUT_SIZE*sizeof(double));
@@ -235,20 +233,17 @@ void backward(NeuralNetworkDevice* net, double* input, double* hidden, double* o
     cudaMemset(d_hidden, 0, HIDDEN_SIZE * sizeof(double));
 
     layerGradient<<<1, OUTPUT_SIZE>>>(d_output, output, target);
-
     hiddenLayerGradient<<<HIDDEN_SIZE, OUTPUT_SIZE>>>(net, d_hidden, hidden, d_output);
-
-
     updateWeights2<<<OUTPUT_SIZE, HIDDEN_SIZE>>>(net, hidden, d_output);
 
     updateWeights1<<<HIDDEN_SIZE, INPUT_SIZE>>>(net, input, d_hidden);
 }
 
 void assignMemory(double** input, double** hidden, double** output, double** label) {
-    cudaMalloc((void**)input, INPUT_SIZE * sizeof(double));
     cudaMalloc((void**)hidden, HIDDEN_SIZE * sizeof(double));
-    cudaMalloc((void**)output, OUTPUT_SIZE * sizeof(double));
+    cudaMalloc((void**)input, INPUT_SIZE * sizeof(double));
     cudaMalloc((void**)label, OUTPUT_SIZE * sizeof(double));
+    cudaMalloc((void**)output, OUTPUT_SIZE * sizeof(double));
 }
 
 // Train network
@@ -264,8 +259,8 @@ void train(NeuralNetworkDevice* net_d, double** images, double** labels, int num
 
         for (int i = 0; i < numImages; i++) {
             double* output = (double*)malloc(OUTPUT_SIZE * sizeof(double));
-            cudaMemcpy(input_d, images[i], INPUT_SIZE * sizeof(double), cudaMemcpyHostToDevice);
             cudaMemcpy(label_d, labels[i], OUTPUT_SIZE * sizeof(double), cudaMemcpyHostToDevice);
+            cudaMemcpy(input_d, images[i], INPUT_SIZE * sizeof(double), cudaMemcpyHostToDevice);
             
             forward(net_d, input_d, hidden_d, output_d);
             backward(net_d, input_d, hidden_d, output_d, label_d);
@@ -300,9 +295,6 @@ void evaluate(NeuralNetworkDevice* net_d, double** images, double** labels, int 
     for (int i = 0; i < numImages; i++) {
         double* output = (double*)malloc(OUTPUT_SIZE * sizeof(double));
         cudaMemcpy(input_d, images[i], INPUT_SIZE * sizeof(double), cudaMemcpyHostToDevice);
-            
-            
-
 
         forward(net_d, input_d, hidden_d, output_d);
         
