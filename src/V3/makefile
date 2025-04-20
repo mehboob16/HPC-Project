@@ -12,6 +12,8 @@ $(EXE): $(SRC)
 run: $(EXE)
 	./$(EXE)
 
+profile: $(EXE)
+	nvprof ./$(EXE)
 
 clean:
 	rm -f $(EXE)
